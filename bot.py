@@ -1,135 +1,81 @@
 import os
-import subprocess
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    MessageHandler,
-    ContextTypes,
-    filters
-)
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.utils import executor
+from moviepy.video.io.VideoFileClip import VideoFileClip
+from moviepy.video.VideoClip import TextClip
+from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
+from dotenv import load_dotenv
 
-# ضع توكن البوت هنا
-TOKEN = "8409383212:AAGn1kYV1T_SpjwR_JA2xtKEV_FFrRlBxfE"
+load_dotenv()
 
-# إنشاء مجلد للمقاطع
-os.makedirs("parts", exist_ok=True)
+API_TOKEN = os.getenv('BOT_TOKEN')
+if not API_TOKEN:
+    print("❌ خطأ: لم يتم العثور على BOT_TOKEN")
+    exit(1)
 
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
+dp.middleware.setup(LoggingMiddleware())
+logging.basicConfig(level=logging.INFO)
 
-async def handle_video(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+user_data = {}
 
-    try:
+ratio_keyboard = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+ratio_keyboard.add(KeyboardButton("16:9"), KeyboardButton("9:16"))
 
-        await update.message.reply_text(
-            "جاري تحميل الفيديو..."
-        )
-
-        # الحصول على الفيديو
-        video = update.message.video
-
-        # تحميل الفيديو
-        tg_file = await context.bot.get_file(
-            video.file_id
-        )
-
-        input_file = "input.mp4"
-
-        await tg_file.download_to_drive(
-            input_file
-        )
-
-        await update.message.reply_text(
-            "جاري تقسيم الفيديو..."
-        )
-
-        # أمر تقسيم الفيديو
-        subprocess.run([
-            "ffmpeg",
-            "-i",
-            input_file,
-            "-c",
-            "copy",
-            "-map",
-            "0",
-            "-segment_time",
-            "30",
-            "-f",
-            "segment",
-            "parts/output%03d.mp4"
-        ])
-
-        # قراءة الملفات الناتجة
-        files = sorted(
-            os.listdir("parts")
-        )
-
-        if not files:
-
-            await update.message.reply_text(
-                "فشل تقسيم الفيديو."
-            )
-
-            return
-
-        await update.message.reply_text(
-            f"تم إنشاء {len(files)} مقطع."
-        )
-
-        # إرسال المقاطع
-        for filename in files:
-
-            file_path = os.path.join(
-                "parts",
-                filename
-            )
-
-            with open(file_path, "rb") as f:
-
-                await update.message.reply_video(
-                    video=f
-                )
-
-        await update.message.reply_text(
-            "تم الانتهاء."
-        )
-
-        # حذف الملفات المؤقتة
-        if os.path.exists(input_file):
-            os.remove(input_file)
-
-        for filename in files:
-
-            path = os.path.join(
-                "parts",
-                filename
-            )
-
-            if os.path.exists(path):
-                os.remove(path)
-
-    except Exception as e:
-
-        await update.message.reply_text(
-            f"حدث خطأ:\n{str(e)}"
-        )
-
-
-# إنشاء التطبيق
-app = ApplicationBuilder().token(
-    TOKEN
-).build()
-
-# استقبال الفيديوهات
-app.add_handler(
-    MessageHandler(
-        filters.VIDEO,
-        handle_video
+@dp.message_handler(commands=['start'])
+async def start(message: types.Message):
+    await message.reply(
+        "🎬 أهلاً بك في بوت معالجة الفيديو!\n\n"
+        "أرسل فيديو مدته 5 دقائق أو أكثر\n"
+        "وسأقوم بقصه وإضافة علامة مائية وتقسيمه"
     )
-)
 
-print("Bot Started...")
+@dp.message_handler(content_types=['video'])
+async def handle_video(message: types.Message):
+    user_id = message.from_user.id
+    if message.video.duration < 300:
+        await message.reply("⏰ أرسل فيديو مدته 5 دقائق أو أكثر")
+        return
+    user_data[user_id] = {'file_id': message.video.file_id}
+    await message.reply("📐 اختر النسبة:", reply_markup=ratio_keyboard)
 
-# تشغيل البوت
-app.run_polling()
+@dp.message_handler(lambda m: m.text in ['16:9', '9:16'])
+async def handle_ratio(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in user_data:
+        await message.reply("أرسل الفيديو أولاً")
+        return
+    
+    msg = await message.reply("⚙️ جاري المعالجة...")
+    try:
+        file = await bot.get_file(user_data[user_id]['file_id'])
+        await bot.download_file(file.file_path, f"input_{user_id}.mp4")
+        
+        clip = VideoFileClip(f"input_{user_id}.mp4")
+        target = (1920, 1080) if message.text == "16:9" else (1080, 1920)
+        clip = clip.resize(target)
+        
+        watermark = TextClip("@YourBot", fontsize=40, color='white').set_opacity(0.6).set_position(('right','bottom')).set_duration(clip.duration)
+        final = CompositeVideoClip([clip, watermark])
+        
+        output = f"output_{user_id}.mp4"
+        final.write_videofile(output, codec='libx264', audio_codec='aac')
+        
+        with open(output, 'rb') as video:
+            await message.reply_video(video, caption="✅ فيديو معالج")
+        
+        os.remove(f"input_{user_id}.mp4")
+        os.remove(output)
+        await msg.edit_text("✨ تم!")
+    except Exception as e:
+        await msg.edit_text(f"❌ خطأ: {str(e)[:100]}")
+    finally:
+        if user_id in user_data:
+            del user_data[user_id]
+
+if __name__ == '__main__':
+    executor.start_polling(dp, skip_updates=True)
