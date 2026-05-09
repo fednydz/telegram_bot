@@ -18,7 +18,6 @@ CHUNK_DURATION = 30
 TEMP_DIR = Path("temp_videos")
 TEMP_DIR.mkdir(exist_ok=True)
 
-# 🟢 رسالة الترحيب وطريقة العمل
 WELCOME_MSG = (
     "👋 أهلاً بك في بوت تقسيم الفيديو!\n\n"
     "📌 *طريقة العمل:*\n"
@@ -28,6 +27,13 @@ WELCOME_MSG = (
     "⚙️ ملاحظات: المعالجة قد تستغرق بضع دقائق حسب طول الفيديو.\n"
     "📩 لأي استفسار أو دعم، تواصل مع المطور."
 )
+
+def is_user_allowed(user_id: int) -> bool:
+    """✅ التحقق من قائمة المستخدمين المسموح لهم"""
+    allowed_ids = os.getenv("ADMIN_ID", "")
+    if not allowed_ids:
+        return True  # لا توجد قيود
+    return str(user_id) in [id.strip() for id in allowed_ids.split(",")]
 
 async def send_welcome(update: Update):
     await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown")
@@ -83,10 +89,8 @@ async def process_video(user_id: int, chat_id: int, msg_id: int, input_path: str
         Path(input_path).unlink(missing_ok=True)
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 🔒 التحقق من الأدمن (اختياري)
-    admin_id = os.getenv("ADMIN_ID")
-    if admin_id and str(update.effective_user.id) != str(admin_id):
-        await update.message.reply_text("❌ هذا البوت خاص بالمطور فقط.")
+    if not is_user_allowed(update.effective_user.id):
+        await update.message.reply_text("❌ عذراً، هذا البوت خاص بمستخدمين محددين فقط.")
         return
 
     msg = await update.message.reply_text("⏳ جاري التحميل والمعالجة... يرجى الانتظار.")
