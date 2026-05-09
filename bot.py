@@ -20,63 +20,100 @@ async def handle_video(
     context: ContextTypes.DEFAULT_TYPE
 ):
 
-    await update.message.reply_text(
-        "جاري تحميل الفيديو..."
-    )
+    try:
 
-    # الحصول على الفيديو
-    video = update.message.video
-
-    # تحميل الفيديو
-    file = await context.bot.get_file(
-        video.file_id
-    )
-
-    await file.download_to_drive(
-        "input.mp4"
-    )
-
-    await update.message.reply_text(
-        "جاري تقسيم الفيديو..."
-    )
-
-    # تقسيم الفيديو إلى أجزاء 30 ثانية
-    subprocess.run([
-        "ffmpeg",
-        "-i",
-        "input.mp4",
-        "-c",
-        "copy",
-        "-map",
-        "0",
-        "-segment_time",
-        "30",
-        "-f",
-        "segment",
-        "parts/output%03d.mp4"
-    ])
-
-    # إرسال المقاطع
-    files = sorted(
-        os.listdir("parts")
-    )
-
-    for filename in files:
-
-        path = os.path.join(
-            "parts",
-            filename
+        await update.message.reply_text(
+            "جاري تحميل الفيديو..."
         )
 
-        with open(path, "rb") as f:
+        # الحصول على الفيديو
+        video = update.message.video
 
-            await update.message.reply_video(
-                video=f
+        # تحميل الفيديو
+        tg_file = await context.bot.get_file(
+            video.file_id
+        )
+
+        input_file = "input.mp4"
+
+        await tg_file.download_to_drive(
+            input_file
+        )
+
+        await update.message.reply_text(
+            "جاري تقسيم الفيديو..."
+        )
+
+        # أمر تقسيم الفيديو
+        subprocess.run([
+            "ffmpeg",
+            "-i",
+            input_file,
+            "-c",
+            "copy",
+            "-map",
+            "0",
+            "-segment_time",
+            "30",
+            "-f",
+            "segment",
+            "parts/output%03d.mp4"
+        ])
+
+        # قراءة الملفات الناتجة
+        files = sorted(
+            os.listdir("parts")
+        )
+
+        if not files:
+
+            await update.message.reply_text(
+                "فشل تقسيم الفيديو."
             )
 
-    await update.message.reply_text(
-        "تم الانتهاء."
-    )
+            return
+
+        await update.message.reply_text(
+            f"تم إنشاء {len(files)} مقطع."
+        )
+
+        # إرسال المقاطع
+        for filename in files:
+
+            file_path = os.path.join(
+                "parts",
+                filename
+            )
+
+            with open(file_path, "rb") as f:
+
+                await update.message.reply_video(
+                    video=f
+                )
+
+        await update.message.reply_text(
+            "تم الانتهاء."
+        )
+
+        # حذف الملفات المؤقتة
+        if os.path.exists(input_file):
+            os.remove(input_file)
+
+        for filename in files:
+
+            path = os.path.join(
+                "parts",
+                filename
+            )
+
+            if os.path.exists(path):
+                os.remove(path)
+
+    except Exception as e:
+
+        await update.message.reply_text(
+            f"حدث خطأ:\n{str(e)}"
+        )
 
 
 # إنشاء التطبيق
