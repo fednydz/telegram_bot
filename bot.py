@@ -31,19 +31,23 @@ def crop_to_ratio(clip, target_ratio):
     """قص الفيديو إلى النسبة المطلوبة"""
     current_ratio = clip.w / clip.h
     if current_ratio > target_ratio:
-        # قص العرض
         new_width = int(target_ratio * clip.h)
         x_center = clip.w / 2
         return clip.crop(x_center=new_width/2, width=new_width)
     else:
-        # قص الارتفاع
         new_height = int(clip.w / target_ratio)
         y_center = clip.h / 2
         return clip.crop(y_center=new_height/2, height=new_height)
 
 def split_video_into_parts(clip, output_dir, duration_per_part=60):
-    """تقسيم الفيديو إلى أجزاء كل جزء مدته duration_per_part ثانية"""
+    """تقسيم الفيديو إلى أجزاء"""
     total_duration = clip.duration
+    if total_duration <= duration_per_part:
+        # إذا كان الفيديو أقصر من مدة التقسيم، لا تقسيمه
+        segment_path = os.path.join(output_dir, f"part_1.mp4")
+        clip.write_videofile(segment_path, codec='libx264', audio_codec='aac', verbose=False, logger=None)
+        return [segment_path]
+    
     num_parts = math.ceil(total_duration / duration_per_part)
     parts_paths = []
     
@@ -62,13 +66,13 @@ def split_video_into_parts(clip, output_dir, duration_per_part=60):
 async def start(message: types.Message):
     await message.reply(
         "🎬 أهلاً بك في بوت معالجة الفيديو!\n\n"
-        "أرسل فيديو مدته 5 دقائق أو أكثر\n"
+        "📤 أرسل أي فيديو (أي مدة كانت)\n"
         "وسأقوم بـ:\n"
-        "1️⃣ قص الفيديو إلى النسبة التي تختارها\n"
+        "1️⃣ قص الفيديو إلى النسبة التي تختارها (16:9 أو 9:16)\n"
         "2️⃣ إضافة علامة مائية\n"
         "3️⃣ تقسيم الفيديو إلى مقاطع (كل 60 ثانية)\n"
         "4️⃣ إرسال جميع المقاطع إليك\n\n"
-        "📤 أرسل الفيديو الآن."
+        "✨ لا توجد شروط على مدة الفيديو!"
     )
 
 @dp.message_handler(content_types=['video'])
@@ -76,19 +80,17 @@ async def handle_video(message: types.Message):
     user_id = message.from_user.id
     video = message.video
     
-    # التحقق من مدة الفيديو (5 دقائق = 300 ثانية)
-    if video.duration < 300:
-        await message.reply("⏰ الفيديو قصير جداً! أرسل فيديو مدته 5 دقائق أو أكثر.")
-        return
+    # لا يوجد شرط على المدة - أي فيديو مقبول
+    duration_min = video.duration // 60
+    duration_sec = video.duration % 60
     
-    # تخزين معلومات الفيديو
     user_data[user_id] = {
         'file_id': video.file_id,
         'duration': video.duration
     }
     
     await message.reply(
-        f"✅ تم استلام الفيديو (مدته: {video.duration // 60} دقيقة و {video.duration % 60} ثانية)\n\n"
+        f"✅ تم استلام الفيديو (مدته: {duration_min} دقيقة و {duration_sec} ثانية)\n\n"
         "📐 الآن اختر النسبة التي تريدها:",
         reply_markup=ratio_keyboard
     )
@@ -102,33 +104,31 @@ async def handle_ratio(message: types.Message):
         await message.reply("❌ حدث خطأ. أرسل الفيديو مرة أخرى باستخدام /start")
         return
     
-    # إعلام المستخدم بالبدء
-    processing_msg = await message.reply("⚙️ جاري معالجة الفيديو... قد يستغرق هذا دقيقة أو أكثر حسب طول الفيديو.")
+    processing_msg = await message.reply("⚙️ جاري معالجة الفيديو... قد يستغرق هذا بضع لحظات.")
     
     try:
-        # 1. تحميل الفيديو من تلغرام
+        # تحميل الفيديو
         file = await bot.get_file(user_data[user_id]['file_id'])
         input_path = f"input_{user_id}.mp4"
         await bot.download_file(file.file_path, input_path)
         
-        # 2. إنشاء مجلد للمخرجات
         output_dir = f"output_{user_id}"
         os.makedirs(output_dir, exist_ok=True)
         
-        # 3. تحميل الفيديو باستخدام moviepy
+        # معالجة الفيديو
         clip = VideoFileClip(input_path)
         
-        # 4. قص الفيديو إلى النسبة المطلوبة
+        # قص النسبة
         target_ratio = 16/9 if ratio == "16:9" else 9/16
         cropped_clip = crop_to_ratio(clip, target_ratio)
         
-        # 5. تغيير الحجم إلى 720p (لتقليل حجم الملف)
+        # تغيير الحجم
         if ratio == "16:9":
             cropped_clip = cropped_clip.resize(height=720)
         else:
             cropped_clip = cropped_clip.resize(width=720)
         
-        # 6. إضافة علامة مائية
+        # إضافة علامة مائية
         watermark_text = "🔹 @mounirdjouida_bot 🔹"
         watermark = (TextClip(watermark_text, fontsize=30, color='white', font='Arial')
                      .set_opacity(0.5)
@@ -137,11 +137,11 @@ async def handle_ratio(message: types.Message):
         
         final_clip = CompositeVideoClip([cropped_clip, watermark])
         
-        # 7. تقسيم الفيديو إلى أجزاء (كل 60 ثانية)
+        # تقسيم الفيديو
         await processing_msg.edit_text("✂️ جاري تقسيم الفيديو إلى مقاطع...")
         parts_paths = split_video_into_parts(final_clip, output_dir, duration_per_part=60)
         
-        # 8. إرسال الأجزاء إلى المستخدم
+        # إرسال المقاطع
         await processing_msg.edit_text(f"📤 جاري إرسال {len(parts_paths)} مقطع...")
         
         for i, part_path in enumerate(parts_paths):
@@ -150,22 +150,21 @@ async def handle_ratio(message: types.Message):
                     types.InputFile(video_file),
                     caption=f"🎬 الجزء {i+1} من {len(parts_paths)}"
                 )
-            os.remove(part_path)  # حذف المقطع بعد الإرسال
+            os.remove(part_path)
         
-        # 9. تنظيف الملفات المؤقتة
+        # تنظيف
         clip.close()
         cropped_clip.close()
         final_clip.close()
         os.remove(input_path)
         os.rmdir(output_dir)
         
-        await processing_msg.edit_text("✨ تم الانتهاء من إرسال جميع المقاطع! شكراً لاستخدام البوت.")
+        await processing_msg.edit_text("✨ تم الانتهاء من إرسال جميع المقاطع!")
         
     except Exception as e:
-        await processing_msg.edit_text(f"❌ حدث خطأ أثناء المعالجة: {str(e)[:200]}")
+        await processing_msg.edit_text(f"❌ حدث خطأ: {str(e)[:200]}")
         logging.error(f"Error: {e}")
     finally:
-        # تنظيف بيانات المستخدم
         if user_id in user_data:
             del user_data[user_id]
 
