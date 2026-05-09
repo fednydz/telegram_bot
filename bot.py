@@ -18,6 +18,26 @@ CHUNK_DURATION = 30
 TEMP_DIR = Path("temp_videos")
 TEMP_DIR.mkdir(exist_ok=True)
 
+# 🟢 رسالة الترحيب وطريقة العمل
+WELCOME_MSG = (
+    "👋 أهلاً بك في بوت تقسيم الفيديو!\n\n"
+    "📌 *طريقة العمل:*\n"
+    "1️⃣ أرسل أي فيديو للبوت.\n"
+    "2️⃣ سيقوم بتقسيمه تلقائياً إلى أجزاء مدة كل جزء 30 ثانية.\n"
+    "3️⃣ سيتم إرسال الأجزاء لك كفيديوهات، أو كملفات إذا تجاوز الحجم 50 ميجا.\n\n"
+    "⚙️ ملاحظات: المعالجة قد تستغرق بضع دقائق حسب طول الفيديو.\n"
+    "📩 لأي استفسار أو دعم، تواصل مع المطور."
+)
+
+async def send_welcome(update: Update):
+    await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_welcome(update)
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_welcome(update)
+
 async def process_video(user_id: int, chat_id: int, msg_id: int, input_path: str, bot):
     try:
         def run_split():
@@ -62,11 +82,14 @@ async def process_video(user_id: int, chat_id: int, msg_id: int, input_path: str
     finally:
         Path(input_path).unlink(missing_ok=True)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 أهلاً! أرسل أي فيديو وسأقوم بتقسيمه إلى أجزاء مدة كل منها 30 ثانية.")
-
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ جاري التحميل والمعالجة...")
+    # 🔒 التحقق من الأدمن (اختياري)
+    admin_id = os.getenv("ADMIN_ID")
+    if admin_id and str(update.effective_user.id) != str(admin_id):
+        await update.message.reply_text("❌ هذا البوت خاص بالمطور فقط.")
+        return
+
+    msg = await update.message.reply_text("⏳ جاري التحميل والمعالجة... يرجى الانتظار.")
     video = update.message.video
     file = await video.get_file()
     input_path = TEMP_DIR / f"{update.effective_user.id}_{video.file_unique_id}.mp4"
@@ -84,6 +107,7 @@ def main():
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
 
     logger.info("🤖 بوت التقسيم يعمل الآن...")
