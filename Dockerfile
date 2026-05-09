@@ -7,11 +7,18 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# نسخ requirements أولاً للاستفادة من Docker cache
+# نسخ ملف المتطلبات أولاً للاستفادة من Docker cache
 COPY requirements.txt .
+
+# تثبيت المكتبات
 RUN pip install --no-cache-dir -r requirements.txt
 
-# نسخ باقي الملفات
+# نسخ باقي الملفات (بما في ذلك logo.png و bot.py)
 COPY . .
+
+# التأكد من وجود ملف الشعار
+RUN if [ ! -f logo.png ]; then \
+      echo "⚠️ Warning: logo.png not found!"; \
+    fi
 
 CMD ["python", "bot.py"]
