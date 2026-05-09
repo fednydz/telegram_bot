@@ -1,1 +1,3 @@
-python-telegram-bot==20.7
+aiogram==2.25.1
+moviepy==1.0.3
+python-dotenv==1.0.0
