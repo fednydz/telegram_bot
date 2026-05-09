@@ -28,13 +28,6 @@ WELCOME_MSG = (
     "📩 لأي استفسار أو دعم، تواصل مع المطور."
 )
 
-def is_user_allowed(user_id: int) -> bool:
-    """✅ التحقق من قائمة المستخدمين المسموح لهم"""
-    allowed_ids = os.getenv("ADMIN_ID", "")
-    if not allowed_ids:
-        return True  # لا توجد قيود
-    return str(user_id) in [id.strip() for id in allowed_ids.split(",")]
-
 async def send_welcome(update: Update):
     await update.message.reply_text(WELCOME_MSG, parse_mode="Markdown")
 
@@ -89,10 +82,7 @@ async def process_video(user_id: int, chat_id: int, msg_id: int, input_path: str
         Path(input_path).unlink(missing_ok=True)
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_user_allowed(update.effective_user.id):
-        await update.message.reply_text("❌ عذراً، هذا البوت خاص بمستخدمين محددين فقط.")
-        return
-
+    # ✅ البوت متاح للجميع الآن
     msg = await update.message.reply_text("⏳ جاري التحميل والمعالجة... يرجى الانتظار.")
     video = update.message.video
     file = await video.get_file()
@@ -114,7 +104,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
 
-    logger.info("🤖 بوت التقسيم يعمل الآن...")
+    logger.info("🌍 بوت التقسيم يعمل الآن ومتاح للجميع...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
