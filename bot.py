@@ -55,14 +55,12 @@ def split_video(input_path, output_dir, max_duration=60):
     return parts, duration
 
 async def safe_edit_message(message, new_text):
-    """تحديث الرسالة بأمان مع تجنب خطأ 'Message is not modified'"""
     try:
         await message.edit_text(new_text)
-        await asyncio.sleep(0.3)  # تأخير بسيط
+        await asyncio.sleep(0.3)
     except BadRequest as e:
         if "message is not modified" in str(e).lower():
-            logger.debug("Message not modified - skipping edit")
-            pass  # تجاهل إذا كان النص نفسه
+            pass
         else:
             raise
     except Exception as e:
@@ -164,20 +162,50 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
         temp_dir = tempfile.mkdtemp()
         video_path = os.path.join(temp_dir, 'yt.mp4')
         
-        await safe_edit_message(status_msg, '🎥 جاري التحميل من يوتيوب...')
-        subprocess.run(['yt-dlp', '-f', 'best[ext=mp4]/best', '-o', video_path, '--no-playlist', url], capture_output=True, timeout=300)
+        await safe_edit_message(status_msg, '🎥 جاري التحميل من يوتيوب...\n⏳ قد يستغرق دقيقة أو دقيقتين')
         
-        if not os.path.exists(video_path):
-            await safe_edit_message(status_msg, '❌ فشل التحميل')
+        # ✅ استخدام yt-dlp مع خيارات محسّنة
+        cmd = [
+            'yt-dlp',
+            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            '--merge-output-format', 'mp4',
+            '-o', video_path,
+            '--no-playlist',
+            '--restrict-filenames',
+            '--no-warnings',
+            '--socket-timeout', '30',
+            '--retries', '3',
+            url
+        ]
+        
+        logger.info(f"Downloading from: {url}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode != 0:
+            logger.error(f"yt-dlp error: {result.stderr}")
+            await safe_edit_message(status_msg, '❌ فشل التحميل من يوتيوب\n⚠️ تأكد من:\n• أن الرابط صحيح\n• أن الفيديو عام (ليس خاص)\n• أن الفيديو ليس طويلاً جداً')
             return
         
-        duration = get_video_duration(video_path)
+        # البحث عن الملف المحمل
+        downloaded_file = None
+        for file in os.listdir(temp_dir):
+            if file.endswith('.mp4') and file != 'input.mp4':
+                downloaded_file = os.path.join(temp_dir, file)
+                break
+        
+        if not downloaded_file or not os.path.exists(downloaded_file):
+            await safe_edit_message(status_msg, '❌ لم يتم العثور على الفيديو')
+            return
+        
+        duration = get_video_duration(downloaded_file)
+        logger.info(f"Video duration: {duration} seconds")
+        
         if duration and duration > MAX_YOUTUBE_DURATION:
-            await safe_edit_message(status_msg, f'❌ الفيديو طويل جداً: {int(duration//60)} دقيقة')
+            await safe_edit_message(status_msg, f'❌ الفيديو طويل جداً: {int(duration//60)} دقيقة\nالحد الأقصى: {MAX_YOUTUBE_DURATION // 60} دقائق')
             return
         
         await safe_edit_message(status_msg, '✂️ جاري التقسيم...')
-        parts, total_duration = split_video(video_path, temp_dir, MAX_DURATION)
+        parts, total_duration = split_video(downloaded_file, temp_dir, MAX_DURATION)
         
         if not parts:
             await safe_edit_message(status_msg, '❌ فشل التقسيم')
@@ -214,8 +242,11 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await safe_edit_message(status_msg, f'✅ تم!\n📊 الأجزاء: {total_parts}\n⏱️ المدة: {int(total_duration)} ثانية')
     
+    except subprocess.TimeoutExpired:
+        logger.error("YouTube download timeout")
+        await safe_edit_message(status_msg, '⏱️ انتهى وقت التحميل\nالفيديو طويل جداً أو الاتصال بطيء')
     except Exception as e:
-        logger.error(f"YouTube error: {e}")
+        logger.error(f"YouTube error: {e}", exc_info=True)
         await safe_edit_message(status_msg, f'❌ خطأ: {str(e)[:100]}')
     
     finally:
