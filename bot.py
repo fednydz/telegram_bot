@@ -12,23 +12,33 @@ from telegram.error import BadRequest
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# ========== المتغيرات ==========
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 MAX_DURATION = 60
 MAX_VIDEO_SIZE = 200 * 1024 * 1024
-MAX_YOUTUBE_DURATION = 10800
+MAX_YOUTUBE_DURATION = 10800  # 3 ساعات
 
+# مسار ملف الكوكيز (في نفس مجلد bot.py)
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+
+# ========== دوال مساعدة ==========
 def is_youtube_url(url):
     youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
     return re.match(youtube_regex, url)
 
 def get_video_duration(input_path):
     try:
-        result = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', input_path], capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+             '-of', 'default=noprint_wrappers=1:nokey=1', input_path],
+            capture_output=True, text=True, timeout=10
+        )
         return float(result.stdout.strip())
     except:
         return None
 
 def split_video(input_path, output_dir, max_duration=60):
+    """تقسيم الفيديو إلى أجزاء"""
     duration = get_video_duration(input_path)
     if duration is None:
         return None, 0
@@ -44,7 +54,13 @@ def split_video(input_path, output_dir, max_duration=60):
         part_duration = min(max_duration, remaining)
         
         try:
-            subprocess.run(['ffmpeg', '-y', '-i', input_path, '-ss', str(start_time), '-t', str(part_duration), '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', output_path], capture_output=True, timeout=120)
+            subprocess.run(
+                ['ffmpeg', '-y', '-i', input_path,
+                 '-ss', str(start_time), '-t', str(part_duration),
+                 '-c', 'copy', '-avoid_negative_ts', 'make_zero',
+                 '-movflags', '+faststart', output_path],
+                capture_output=True, timeout=120
+            )
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
                 parts.append(output_path)
                 logger.info(f"✅ Part {part_num} created")
@@ -56,6 +72,7 @@ def split_video(input_path, output_dir, max_duration=60):
     return parts, duration
 
 async def safe_edit_message(message, new_text):
+    """تحديث الرسالة بأمان"""
     try:
         await message.edit_text(new_text)
         await asyncio.sleep(0.3)
@@ -67,14 +84,33 @@ async def safe_edit_message(message, new_text):
     except Exception as e:
         logger.error(f"Edit error: {e}")
 
+# ========== الأوامر ==========
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cookies_status = "✅" if os.path.exists(COOKIES_FILE) else "❌"
     await update.message.reply_text(
-        "👋 أهلاً! أنا بوت تقسيم الفيديوهات.\n\n"
-        "📹 أرسل فيديو (حتى 200MB) أو رابط يوتيوب\n"
-        "️ سأقسمه إلى أجزاء 60 ثانية\n"
-        "🎥 أدعم فيديوهات حتى 3 ساعات!"
+        f"👋 أهلاً! أنا بوت تقسيم الفيديوهات.\n\n"
+        f"📹 أرسل فيديو (حتى 200MB) أو رابط يوتيوب\n"
+        f"⏱️ سأقسمه إلى أجزاء 60 ثانية\n"
+        f"🎥 أدعم فيديوهات حتى 3 ساعات!\n\n"
+        f"🍪 حالة الكوكيز: {cookies_status}"
     )
 
+async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض حالة الكوكيز"""
+    if os.path.exists(COOKIES_FILE):
+        size = os.path.getsize(COOKIES_FILE)
+        await update.message.reply_text(
+            f"🍪 الكوكيز موجودة وجاهزة!\n"
+            f"📦 الحجم: {size} bytes\n"
+            f"📍 المسار: {COOKIES_FILE}"
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ ملف الكوكيز غير موجود!\n"
+            f"📍 المسار المتوقع: {COOKIES_FILE}"
+        )
+
+# ========== معالجة الفيديو المباشر ==========
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     video = message.video or (message.document if message.document and message.document.mime_type.startswith('video/') else None)
@@ -84,7 +120,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     file_size = video.file_size or 0
     if file_size > MAX_VIDEO_SIZE:
-        await message.reply_text(f" الفيديو كبير جداً! الحد: {MAX_VIDEO_SIZE // (1024*1024)}MB")
+        await message.reply_text(f"❌ الفيديو كبير جداً!\nالحد: {MAX_VIDEO_SIZE // (1024*1024)}MB")
         return
     
     status_msg = await message.reply_text('⏳ جاري التحميل...')
@@ -97,7 +133,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await video.get_file()
         await file.download_to_drive(input_path)
         
-        if not os.path.exists(input_path):
+        if not os.path.exists(input_path) or os.path.getsize(input_path) < 1000:
             await safe_edit_message(status_msg, '❌ فشل التحميل')
             return
         
@@ -118,13 +154,20 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             try:
                 with open(part_path, 'rb') as f:
-                    await message.reply_video(video=f, caption=f'الجزء {i}/{len(parts)}', supports_streaming=True)
+                    await message.reply_video(
+                        video=f,
+                        caption=f'الجزء {i}/{len(parts)}',
+                        supports_streaming=True
+                    )
             except:
                 with open(part_path, 'rb') as f:
-                    await message.reply_document(document=f, caption=f'الجزء {i}/{len(parts)}')
+                    await message.reply_document(
+                        document=f,
+                        caption=f'الجزء {i}/{len(parts)}'
+                    )
             await asyncio.sleep(0.5)
         
-        await safe_edit_message(status_msg, f'✅ تم! {len(parts)} جزء')
+        await safe_edit_message(status_msg, f'✅ تم!\n📊 الأجزاء: {len(parts)}')
         
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
@@ -133,6 +176,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
+# ========== معالجة يوتيوب ==========
 async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
     if not is_youtube_url(url):
@@ -144,8 +188,13 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         temp_dir = tempfile.mkdtemp()
         
-        subprocess.run(['yt-dlp', '-U', '--quiet'], capture_output=True, timeout=30)
+        # تحديث yt-dlp
+        try:
+            subprocess.run(['yt-dlp', '-U', '--quiet'], capture_output=True, timeout=30)
+        except:
+            pass
         
+        # بناء أمر yt-dlp
         cmd = [
             'yt-dlp',
             '-f', 'bestvideo+bestaudio/best',
@@ -155,22 +204,36 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
             '--restrict-filenames',
             '--no-warnings',
             '--socket-timeout', '30',
-            '--retries', '3',
-            '--extractor-args', 'youtube:player_client=web',
-            url
+            '--retries', '5',
+            '--extractor-retries', '5',
         ]
         
+        # ✅ إضافة الكوكيز إذا كان الملف موجوداً
+        if os.path.exists(COOKIES_FILE):
+            cmd.extend(['--cookies', COOKIES_FILE])
+            logger.info(f"🍪 Using cookies from: {COOKIES_FILE}")
+        else:
+            logger.warning(f"⚠️ Cookies file not found: {COOKIES_FILE}")
+            await safe_edit_message(status_msg, '⚠️ ملف الكوكيز غير موجود!\nالتحميل قد يفشل بسبب التحقق')
+        
+        cmd.append(url)
+        
         logger.info(f"🎥 Downloading: {url}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        await safe_edit_message(status_msg, '🎥 جاري التحميل من يوتيوب...\n⏳ قد يستغرق عدة دقائق')
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
         
         if result.returncode != 0:
             logger.error(f"yt-dlp error: {result.stderr}")
-            if 'Requested format is not available' in result.stderr:
+            if 'Sign in to confirm' in result.stderr or 'bot' in result.stderr.lower():
+                await safe_edit_message(status_msg, '⚠️ يوتيوب يطلب التحقق\n🍪 الكوكيز منتهية أو غير كافية\nجرب رابط آخر أو حدّث الكوكيز')
+            elif 'Requested format is not available' in result.stderr:
                 await safe_edit_message(status_msg, '❌ الصيغة غير متاحة\nجرب فيديو آخر')
             else:
-                await safe_edit_message(status_msg, f'❌ فشل التحميل\n{result.stderr[:100]}')
+                await safe_edit_message(status_msg, f'❌ فشل التحميل\n{result.stderr[:150]}')
             return
         
+        # البحث عن الملف
         video_file = None
         for ext in ['mp4', 'mkv', 'webm']:
             file_path = os.path.join(temp_dir, f'video.{ext}')
@@ -193,7 +256,7 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_message(status_msg, f'❌ طويل جداً: {int(duration//60)} دقيقة (الحد: {MAX_YOUTUBE_DURATION//60})')
             return
         
-        await safe_edit_message(status_msg, '✂️ جاري التقسيم...')
+        await safe_edit_message(status_msg, f'✂️ جاري التقسيم...\n⏱️ المدة: {int(duration//60)} دقيقة')
         parts, total_duration = split_video(video_file, temp_dir, MAX_DURATION)
         
         if not parts:
@@ -207,13 +270,20 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
             try:
                 with open(part_path, 'rb') as f:
-                    await update.message.reply_video(video=f, caption=f'الجزء {i}/{len(parts)}', supports_streaming=True)
+                    await update.message.reply_video(
+                        video=f,
+                        caption=f'الجزء {i}/{len(parts)}',
+                        supports_streaming=True
+                    )
             except:
                 with open(part_path, 'rb') as f:
-                    await update.message.reply_document(document=f, caption=f'الجزء {i}/{len(parts)}')
+                    await update.message.reply_document(
+                        document=f,
+                        caption=f'الجزء {i}/{len(parts)}'
+                    )
             await asyncio.sleep(0.5)
         
-        await safe_edit_message(status_msg, f'✅ تم! {len(parts)} جزء')
+        await safe_edit_message(status_msg, f'✅ تم!\n📊 الأجزاء: {len(parts)}\n⏱️ المدة: {int(total_duration//60)} دقيقة')
     
     except subprocess.TimeoutExpired:
         await safe_edit_message(status_msg, '⏱️ انتهى الوقت')
@@ -224,16 +294,22 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if temp_dir and os.path.exists(temp_dir):
             shutil.rmtree(temp_dir)
 
+# ========== التشغيل ==========
 def main():
     if not BOT_TOKEN:
-        logger.error("No token!")
+        logger.error("❌ TELEGRAM_BOT_TOKEN not set!")
         return
     
-    logger.info("🚀 Starting bot...")
+    logger.info(f"🚀 Starting bot...")
+    logger.info(f"🍪 Cookies file: {COOKIES_FILE} ({'✅ exists' if os.path.exists(COOKIES_FILE) else '❌ missing'})")
+    
     app = Application.builder().token(BOT_TOKEN).build()
+    
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("cookies", cookies_command))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.MimeType('video/*'), handle_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube))
+    
     logger.info("✅ Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
