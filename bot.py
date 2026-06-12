@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 MAX_DURATION = 60
 MAX_VIDEO_SIZE = 200 * 1024 * 1024
-MAX_YOUTUBE_DURATION = 600
+MAX_YOUTUBE_DURATION = 10800  # ✅ 3 ساعات (10,800 ثانية)
 
 def is_youtube_url(url):
     youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
@@ -37,6 +37,8 @@ def split_video(input_path, output_dir, max_duration=60):
     part_num = 0
     start_time = 0.0
     
+    logger.info(f"✂️ Splitting {duration}s video into {max_duration}s parts...")
+    
     while start_time < duration:
         part_num += 1
         output_path = os.path.join(output_dir, f'part_{part_num:03d}.mp4')
@@ -44,11 +46,12 @@ def split_video(input_path, output_dir, max_duration=60):
         part_duration = min(max_duration, remaining)
         
         try:
-            subprocess.run(['ffmpeg', '-y', '-i', input_path, '-ss', str(start_time), '-t', str(part_duration), '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', output_path], capture_output=True, timeout=60)
+            subprocess.run(['ffmpeg', '-y', '-i', input_path, '-ss', str(start_time), '-t', str(part_duration), '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', output_path], capture_output=True, timeout=120)
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
                 parts.append(output_path)
+                logger.info(f"✅ Created part {part_num}/{int(duration//max_duration)+1}")
         except Exception as e:
-            logger.error(f"Split error: {e}")
+            logger.error(f"Split error at {start_time}s: {e}")
         
         start_time += part_duration
     
@@ -70,7 +73,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 أهلاً! أنا بوت تقسيم الفيديوهات.\n\n"
         "📹 أرسل فيديو (حتى 200MB) أو رابط يوتيوب\n"
-        "⏱️ سأقسمه إلى أجزاء 60 ثانية"
+        "⏱️ سأقسمه إلى أجزاء 60 ثانية\n"
+        "🎥 أدعم فيديوهات حتى 3 ساعات!"
     )
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -101,7 +105,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_message(status_msg, '❌ فشل التحميل')
             return
         
-        await safe_edit_message(status_msg, '✂️ جاري التقسيم...')
+        duration = get_video_duration(input_path)
+        if duration:
+            await safe_edit_message(status_msg, f'✂️ جاري التقسيم...\n⏱️ المدة: {int(duration//60)} دقيقة\n📊 الأجزاء المتوقعة: {int(duration//60)+1}')
+        
         parts, total_duration = split_video(input_path, temp_dir, MAX_DURATION)
         
         if not parts:
@@ -137,7 +144,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             
             await asyncio.sleep(0.5)
         
-        await safe_edit_message(status_msg, f'✅ تم!\n📊 الأجزاء: {total_parts}\n⏱️ المدة: {int(total_duration)} ثانية\n🗑️ تم الحذف')
+        await safe_edit_message(status_msg, f'✅ تم!\n📊 الأجزاء: {total_parts}\n⏱️ المدة: {int(total_duration//60)} دقيقة\n🗑️ تم الحذف')
         
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
@@ -160,51 +167,65 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     try:
         temp_dir = tempfile.mkdtemp()
-        video_path = os.path.join(temp_dir, 'yt.mp4')
+        video_path = os.path.join(temp_dir, 'video')
         
-        await safe_edit_message(status_msg, '🎥 جاري التحميل من يوتيوب...\n⏳ قد يستغرق دقيقة أو دقيقتين')
+        await safe_edit_message(status_msg, '🎥 جاري التحميل من يوتيوب...\n⏳ قد يستغرق عدة دقائق للفيديوهات الطويلة')
         
-        # ✅ استخدام yt-dlp مع خيارات محسّنة
+        # تحديث yt-dlp
+        try:
+            subprocess.run(['yt-dlp', '-U'], capture_output=True, timeout=30)
+        except:
+            pass
+        
+        # ✅ زيادة المهلة لـ 3 ساعات (10,800 ثانية)
         cmd = [
             'yt-dlp',
-            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best',
             '--merge-output-format', 'mp4',
-            '-o', video_path,
+            '-o', f'{video_path}.%(ext)s',
             '--no-playlist',
             '--restrict-filenames',
             '--no-warnings',
-            '--socket-timeout', '30',
-            '--retries', '3',
+            '--socket-timeout', '60',
+            '--retries', '5',
+            '--fragment-retries', '5',
+            '--extractor-retries', '3',
+            '--no-check-certificate',
             url
         ]
         
-        logger.info(f"Downloading from: {url}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        logger.info(f"🎥 Downloading from: {url}")
+        # ✅ زيادة المهلة إلى 1800 ثانية (30 دقيقة) للتحميل
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
         
         if result.returncode != 0:
             logger.error(f"yt-dlp error: {result.stderr}")
-            await safe_edit_message(status_msg, '❌ فشل التحميل من يوتيوب\n⚠️ تأكد من:\n• أن الرابط صحيح\n• أن الفيديو عام (ليس خاص)\n• أن الفيديو ليس طويلاً جداً')
+            await safe_edit_message(status_msg, '❌ فشل التحميل من يوتيوب')
             return
         
-        # البحث عن الملف المحمل
+        # البحث عن الملف
         downloaded_file = None
         for file in os.listdir(temp_dir):
-            if file.endswith('.mp4') and file != 'input.mp4':
+            if file.endswith(('.mp4', '.mkv', '.webm')):
                 downloaded_file = os.path.join(temp_dir, file)
+                logger.info(f"✅ Found: {file}")
                 break
         
-        if not downloaded_file or not os.path.exists(downloaded_file):
+        if not downloaded_file:
             await safe_edit_message(status_msg, '❌ لم يتم العثور على الفيديو')
             return
         
         duration = get_video_duration(downloaded_file)
-        logger.info(f"Video duration: {duration} seconds")
+        logger.info(f"⏱️ Duration: {duration}s ({int(duration//60)} min)")
         
+        # ✅ التحقق من مدة 3 ساعات
         if duration and duration > MAX_YOUTUBE_DURATION:
-            await safe_edit_message(status_msg, f'❌ الفيديو طويل جداً: {int(duration//60)} دقيقة\nالحد الأقصى: {MAX_YOUTUBE_DURATION // 60} دقائق')
+            await safe_edit_message(status_msg, f'❌ الفيديو طويل جداً: {int(duration//3600)} ساعة {int((duration%3600)//60)} دقيقة\nالحد الأقصى: 3 ساعات')
             return
         
-        await safe_edit_message(status_msg, '✂️ جاري التقسيم...')
+        estimated_parts = int(duration // 60) + 1
+        await safe_edit_message(status_msg, f'✂️ جاري التقسيم...\n⏱️ المدة: {int(duration//60)} دقيقة\n📊 عدد الأجزاء: {estimated_parts}')
+        
         parts, total_duration = split_video(downloaded_file, temp_dir, MAX_DURATION)
         
         if not parts:
@@ -235,16 +256,17 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             caption=f'🎬 الجزء {i}/{total_parts}',
                             supports_streaming=True
                         )
+                logger.info(f"📤 Sent {i}/{total_parts}")
             except Exception as e:
-                logger.error(f"Failed to send part {i}: {e}")
+                logger.error(f"Send error: {e}")
             
             await asyncio.sleep(0.5)
         
-        await safe_edit_message(status_msg, f'✅ تم!\n📊 الأجزاء: {total_parts}\n⏱️ المدة: {int(total_duration)} ثانية')
+        await safe_edit_message(status_msg, f'✅ تم بنجاح!\n📊 الأجزاء: {total_parts}\n⏱️ المدة: {int(total_duration//60)} دقيقة')
     
     except subprocess.TimeoutExpired:
-        logger.error("YouTube download timeout")
-        await safe_edit_message(status_msg, '⏱️ انتهى وقت التحميل\nالفيديو طويل جداً أو الاتصال بطيء')
+        logger.error("Download timeout")
+        await safe_edit_message(status_msg, '⏱️ انتهى وقت التحميل')
     except Exception as e:
         logger.error(f"YouTube error: {e}", exc_info=True)
         await safe_edit_message(status_msg, f'❌ خطأ: {str(e)[:100]}')
@@ -261,7 +283,7 @@ def main():
         logger.error("No token!")
         return
     
-    logger.info("🚀 Starting Telegram video splitter bot...")
+    logger.info("🚀 Starting Telegram bot (supports up to 3 hours)...")
     app = Application.builder().token(BOT_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start_command))
