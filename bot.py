@@ -1,93 +1,392 @@
 import os
 import asyncio
-import subprocess
 import tempfile
+import subprocess
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+import re
+from telegram import Update
+from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
+from dotenv import load_dotenv
 
-TOKEN = os.getenv("BOT_TOKEN")
-WAIT_VIDEO, WAIT_RATIO = range(2)
-logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+load_dotenv()
+
+# ========== إعداد السجلات ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎬 أرسل فيديو لتقسيمه إلى أجزاء مدة كل منها 40 ثانية.")
-    return WAIT_VIDEO
+# ========== المتغيرات ==========
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+MAX_DURATION = 60  # أقصى مدة للجزء بالثواني
+MAX_VIDEO_SIZE = 50 * 1024 * 1024  # 50 ميجابايت
+MAX_YOUTUBE_DURATION = 600  # 10 دقائق كحد أقصى لليوتيوب
 
-async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    video = update.message.video
-    if not video or video.file_size > 50 * 1024 * 1024:
-        await update.message.reply_text("⚠️ أرسل فيديو صالح وأقل من 50 ميجابايت.")
-        return WAIT_VIDEO
+# ========== التحقق من رابط يوتيوب ==========
+def is_youtube_url(url):
+    """التحقق إذا كان الرابط من يوتيوب"""
+    youtube_regex = (
+        r'(https?://)?(www\.)?'
+        '(youtube|youtu|youtube-nocookie)\.(com|be)/'
+        '(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
+    )
+    return re.match(youtube_regex, url)
 
-    tmp_dir = tempfile.TemporaryDirectory()
-    input_path = os.path.join(tmp_dir.name, "input.mp4")
+# ========== دوال الفيديو ==========
+def get_video_duration(input_path):
+    """الحصول على مدة الفيديو بالثواني"""
+    try:
+        result = subprocess.run(
+            [
+                'ffprobe', '-v', 'error',
+                '-show_entries', 'format=duration',
+                '-of', 'default=noprint_wrappers=1:nokey=1',
+                input_path
+            ],
+            capture_output=True, text=True, timeout=10
+        )
+        return float(result.stdout.strip())
+    except Exception as e:
+        logger.error(f"Duration error: {e}")
+        return None
+
+def split_video(input_path, output_dir, max_duration=60):
+    """تقسيم الفيديو إلى أجزاء باستخدام ffmpeg"""
+    duration = get_video_duration(input_path)
+    if duration is None:
+        return None, 0
+    
+    parts = []
+    part_num = 0
+    start_time = 0.0
+    
+    while start_time < duration:
+        part_num += 1
+        output_path = os.path.join(output_dir, f'part_{part_num:03d}.mp4')
+        
+        remaining = duration - start_time
+        part_duration = min(max_duration, remaining)
+        
+        try:
+            subprocess.run(
+                [
+                    'ffmpeg', '-y',
+                    '-i', input_path,
+                    '-ss', str(start_time),
+                    '-t', str(part_duration),
+                    '-c', 'copy',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-movflags', '+faststart',
+                    output_path
+                ],
+                capture_output=True, timeout=60
+            )
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
+                parts.append(output_path)
+        except Exception as e:
+            logger.error(f"Split error at {start_time}s: {e}")
+        
+        start_time += part_duration
+    
+    return parts, duration
+
+def download_youtube_video(url, output_path):
+    """تحميل فيديو من يوتيوب باستخدام yt-dlp"""
+    try:
+        cmd = [
+            'yt-dlp',
+            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            '--merge-output-format', 'mp4',
+            '-o', output_path,
+            '--no-playlist',
+            '--restrict-filenames',
+            url
+        ]
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=600  # 10 دقائق كحد أقصى
+        )
+        
+        if result.returncode == 0:
+            # البحث عن الملف المحمل
+            base_path = output_path.replace('.%(ext)s', '')
+            for file in os.listdir(os.path.dirname(output_path)):
+                if file.startswith(os.path.basename(base_path)) and file.endswith('.mp4'):
+                    return os.path.join(os.path.dirname(output_path), file)
+            return None
+        else:
+            logger.error(f"yt-dlp error: {result.stderr}")
+            return None
+            
+    except subprocess.TimeoutExpired:
+        logger.error("YouTube download timeout")
+        return None
+    except Exception as e:
+        logger.error(f"YouTube download error: {e}")
+        return None
+
+# ========== معالجة الأوامر ==========
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """رسالة الترحيب"""
+    await update.message.reply_text(
+        "👋 أهلاً بك في بوت تقسيم الفيديوهات!\n\n"
+        "📹 **ماذا أفعل؟**\n"
+        "1️⃣ أرسل فيديو مباشرة وسأقسمه إلى أجزاء (60 ثانية)\n"
+        "2️⃣ أرسل رابط يوتيوب وسأحمله وأقسمه لك\n\n"
+        "⚙️ **المميزات:**\n"
+        "• تقسيم سريع ودقيق\n"
+        "• الحفاظ على جودة الفيديو\n"
+        "• دعم فيديوهات حتى 50 ميجابايت\n"
+        "• تحميل من يوتيوب (حتى 10 دقائق)\n\n"
+        "📝 **اكتب /help للمزيد من المعلومات**"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """رسالة المساعدة"""
+    await update.message.reply_text(
+        "📖 **كيفية الاستخدام:**\n\n"
+        "**📹 للفيديوهات المباشرة:**\n"
+        "1️⃣ أرسل الفيديو مباشرة\n"
+        "2️⃣ انتظر حتى يتم التقسيم\n"
+        "3️⃣ ستستلم الأجزاء واحداً تلو الآخر\n\n"
+        "**🎥 لليوتيوب:**\n"
+        "1️⃣ أرسل رابط فيديو يوتيوب\n"
+        "2️⃣ سأقوم بتحميله وتقسيمه\n"
+        "3️⃣ ستستلم الأجزاء مقسمة\n\n"
+        "⚠️ **ملاحظات:**\n"
+        "• الحد الأقصى للفيديو المباشر: 50 ميجابايت\n"
+        "• الحد الأقصى لليوتيوب: 10 دقائق\n"
+        "• مدة كل جزء: 60 ثانية كحد أقصى\n"
+        "• قد تستغرق العملية بضع دقائق للفيديوهات الطويلة"
+    )
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض حالة البوت"""
+    await update.message.reply_text(
+        "🤖 **حالة البوت:**\n"
+        "✅ البوت يعمل بشكل طبيعي\n"
+        f"⏱️ مدة كل جزء: {MAX_DURATION} ثانية\n"
+        f"📦 الحد الأقصى (فيديو): {MAX_VIDEO_SIZE // (1024*1024)} ميجابايت\n"
+        f"🎥 الحد الأقصى (يوتيوب): {MAX_YOUTUBE_DURATION // 60} دقائق\n\n"
+        "أرسل فيديو أو رابط يوتيوب للبدء!"
+    )
+
+# ========== معالجة الفيديو المباشر ==========
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """استقبال الفيديو وتقسيمه"""
+    message = update.message
+    
+    # الحصول على الفيديو
+    video = message.video
+    if not video:
+        if message.document and message.document.mime_type.startswith('video/'):
+            video = message.document
+        else:
+            return
+    
+    # التحقق من الحجم
+    if video.file_size and video.file_size > MAX_VIDEO_SIZE:
+        await message.reply_text(
+            f"❌ الفيديو كبير جداً!\n"
+            f"الحد الأقصى: {MAX_VIDEO_SIZE // (1024*1024)} ميجابايت\n"
+            f"حجم الفيديو: {video.file_size // (1024*1024)} ميجابايت"
+        )
+        return
+    
+    status_msg = await message.reply_text('⏳ جاري تحميل الفيديو...')
     
     try:
-        video_file = await context.bot.get_file(video.file_id)
-        await video_file.download_to_drive(input_path)
-    except:
-        await update.message.reply_text("❌ فشل تحميل الفيديو.")
-        return WAIT_VIDEO
-
-    context.user_data["tmp_dir"] = tmp_dir
-    context.user_data["input_path"] = input_path
-
-    keyboard = [
-        [InlineKeyboardButton("📺 16:9", callback_data="16:9")],
-        [InlineKeyboardButton("📱 9:16", callback_data="9:16")]
-    ]
-    await update.message.reply_text("✅ اختر نسبة العرض:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return WAIT_RATIO
-
-async def select_ratio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    ratio = query.data
-    tmp_dir = context.user_data["tmp_dir"]
-    input_path = context.user_data["input_path"]
-    resized_path = os.path.join(tmp_dir.name, "resized.mp4")
-
-    vf = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2" if ratio == "16:9" else "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2"
-
-    try:
-        subprocess.run(["ffmpeg", "-y", "-i", input_path, "-vf", vf, "-c:a", "copy", resized_path], check=True)
-        output_pattern = os.path.join(tmp_dir.name, "part_%03d.mp4")
-        subprocess.run([
-            "ffmpeg", "-y", "-i", resized_path, "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-            "-c:a", "aac", "-b:a", "128k", "-map", "0", "-segment_time", "40",
-            "-f", "segment", "-reset_timestamps", "1", output_pattern
-        ], check=True)
-
-        parts = sorted([f for f in os.listdir(tmp_dir.name) if f.startswith("part_")])
-        for i, part in enumerate(parts, 1):
-            with open(os.path.join(tmp_dir.name, part), "rb") as vid:
-                await query.message.reply_video(vid, caption=f"🎞️ الجزء {i}")
-            await asyncio.sleep(1.5)
-        await query.message.reply_text("✅ تم الانتهاء!")
+        file = await video.get_file()
+        
+        with tempfile.TemporaryDirectory() as temp_dir:
+            input_path = os.path.join(temp_dir, 'input.mp4')
+            
+            await status_msg.edit_text('⏳ جاري تحميل الفيديو...')
+            await file.download_to_drive(input_path)
+            
+            if not os.path.exists(input_path) or os.path.getsize(input_path) < 1000:
+                await status_msg.edit_text('❌ فشل في تحميل الفيديو')
+                return
+            
+            await status_msg.edit_text('✂️ جاري تقسيم الفيديو...')
+            parts, total_duration = split_video(input_path, temp_dir, MAX_DURATION)
+            
+            if not parts:
+                await status_msg.edit_text('❌ فشل في تقسيم الفيديو')
+                return
+            
+            total_parts = len(parts)
+            await status_msg.edit_text(
+                f'📤 جاري إرسال {total_parts} جزء...\n'
+                f'⏱️ المدة الكلية: {int(total_duration)} ثانية'
+            )
+            
+            for i, part_path in enumerate(parts, 1):
+                file_size = os.path.getsize(part_path)
+                
+                if file_size > MAX_VIDEO_SIZE:
+                    with open(part_path, 'rb') as f:
+                        await message.reply_document(
+                            document=f,
+                            caption=f'📹 الجزء {i} من {total_parts}',
+                            filename=f'part_{i}.mp4'
+                        )
+                else:
+                    with open(part_path, 'rb') as f:
+                        await message.reply_video(
+                            video=f,
+                            caption=f'🎬 الجزء {i} من {total_parts}',
+                            supports_streaming=True
+                        )
+                
+                await asyncio.sleep(0.5)
+            
+            await status_msg.edit_text(
+                f'✅ تم بنجاح!\n'
+                f'📊 عدد الأجزاء: {total_parts}\n'
+                f'⏱️ المدة الكلية: {int(total_duration)} ثانية'
+            )
+    
     except Exception as e:
-        logger.error(e)
-        await query.message.reply_text(f"❌ خطأ: {e}")
-    finally:
-        tmp_dir.cleanup()
-        context.user_data.clear()
-    return ConversationHandler.END
+        logger.error(f"Video processing error: {e}", exc_info=True)
+        await status_msg.edit_text(f'❌ حدث خطأ: {str(e)}')
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🛑 تم الإلغاء.")
-    return ConversationHandler.END
+# ========== معالجة روابط يوتيوب ==========
+async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تحميل فيديو من يوتيوب وتقسيمه"""
+    message = update.message
+    url = message.text
+    
+    status_msg = await message.reply_text('🎥 جاري التحميل من يوتيوب...')
+    
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            video_path = os.path.join(temp_dir, 'youtube_video.%(ext)s')
+            
+            await status_msg.edit_text('🎥 جاري تحميل الفيديو من يوتيوب...\n⏳ قد يستغرق هذا بضع دقائق')
+            
+            # تحميل الفيديو
+            downloaded_path = download_youtube_video(url, video_path)
+            
+            if not downloaded_path or not os.path.exists(downloaded_path):
+                await status_msg.edit_text(
+                    '❌ فشل في تحميل الفيديو من يوتيوب\n'
+                    'تأكد من:\n'
+                    '• صحة الرابط\n'
+                    '• أن الفيديو ليس طويلاً جداً (أقصى مدة 10 دقائق)\n'
+                    '• أن الفيديو متاح للتحميل'
+                )
+                return
+            
+            # التحقق من المدة
+            duration = get_video_duration(downloaded_path)
+            if duration and duration > MAX_YOUTUBE_DURATION:
+                await status_msg.edit_text(
+                    f'❌ الفيديو طويل جداً!\n'
+                    f'المدة: {int(duration // 60)} دقيقة\n'
+                    f'الحد الأقصى: {MAX_YOUTUBE_DURATION // 60} دقائق'
+                )
+                return
+            
+            # تقسيم الفيديو
+            await status_msg.edit_text('✂️ جاري تقسيم الفيديو...')
+            parts, total_duration = split_video(downloaded_path, temp_dir, MAX_DURATION)
+            
+            if not parts:
+                await status_msg.edit_text('❌ فشل في تقسيم الفيديو')
+                return
+            
+            # إرسال الأجزاء
+            total_parts = len(parts)
+            await status_msg.edit_text(
+                f'📤 جاري إرسال {total_parts} جزء...\n'
+                f'⏱️ المدة الكلية: {int(total_duration)} ثانية'
+            )
+            
+            for i, part_path in enumerate(parts, 1):
+                file_size = os.path.getsize(part_path)
+                
+                if file_size > MAX_VIDEO_SIZE:
+                    with open(part_path, 'rb') as f:
+                        await message.reply_document(
+                            document=f,
+                            caption=f' الجزء {i} من {total_parts}',
+                            filename=f'youtube_part_{i}.mp4'
+                        )
+                else:
+                    with open(part_path, 'rb') as f:
+                        await message.reply_video(
+                            video=f,
+                            caption=f'🎬 الجزء {i} من {total_parts}',
+                            supports_streaming=True
+                        )
+                
+                await asyncio.sleep(0.5)
+            
+            await status_msg.edit_text(
+                f'✅ تم بنجاح!\n'
+                f'📊 عدد الأجزاء: {total_parts}\n'
+                f'⏱️ المدة الكلية: {int(total_duration)} ثانية'
+            )
+    
+    except Exception as e:
+        logger.error(f"YouTube processing error: {e}", exc_info=True)
+        await status_msg.edit_text(f'❌ حدث خطأ: {str(e)}')
 
+# ========== معالجة الرسائل النصية ==========
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة الرسائل النصية (رابط يوتيوب)"""
+    text = update.message.text
+    
+    if text and is_youtube_url(text):
+        await handle_youtube_url(update, context)
+
+# ========== معالجة الأخطاء ==========
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(f"Exception while handling an update: {context.error}")
+
+# ========== التشغيل الرئيسي ==========
 def main():
-    app = Application.builder().token(TOKEN).build()
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={WAIT_VIDEO: [MessageHandler(filters.VIDEO, receive_video)], WAIT_RATIO: [MessageHandler(filters.ALL, select_ratio)]},
-        fallbacks=[CommandHandler("cancel", cancel)]
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN not set!")
+        return
+    
+    logger.info("🚀 Starting Telegram video splitter bot with YouTube support...")
+    
+    # إنشاء التطبيق
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # إضافة المعالجات
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status_command))
+    
+    # معالجة الفيديوهات المباشرة
+    application.add_handler(
+        MessageHandler(
+            filters.VIDEO | (filters.Document.MimeType('video/*')),
+            handle_video
+        )
     )
-    app.add_handler(conv)
-    print("🤖 Bot running...")
-    app.run_polling()
+    
+    # معالجة روابط يوتيوب
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message
+        )
+    )
+    
+    # معالج الأخطاء
+    application.add_error_handler(error_handler)
+    
+    # بدء البوت
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
