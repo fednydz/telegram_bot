@@ -4,6 +4,7 @@ import tempfile
 import subprocess
 import logging
 import re
+import shutil
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes, CommandHandler
 
@@ -12,7 +13,8 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 MAX_DURATION = 60
-MAX_VIDEO_SIZE = 50 * 1024 * 1024
+MAX_VIDEO_SIZE = 200 * 1024 * 1024  # 200 ميجابايت
+MAX_YOUTUBE_DURATION = 600  # 10 دقائق
 
 def is_youtube_url(url):
     youtube_regex = r'(https?://)?(www\.)?(youtube|youtu|youtube-nocookie)\.(com|be)/(watch\?v=|embed/|v/|.+\?v=)?([^&=%\?]{11})'
@@ -44,6 +46,7 @@ def split_video(input_path, output_dir, max_duration=60):
             subprocess.run(['ffmpeg', '-y', '-i', input_path, '-ss', str(start_time), '-t', str(part_duration), '-c', 'copy', '-avoid_negative_ts', 'make_zero', '-movflags', '+faststart', output_path], capture_output=True, timeout=60)
             if os.path.exists(output_path) and os.path.getsize(output_path) > 1000:
                 parts.append(output_path)
+                logger.info(f"✅ Created part {part_num}: {os.path.getsize(output_path)} bytes")
         except Exception as e:
             logger.error(f"Split error: {e}")
         
@@ -51,8 +54,15 @@ def split_video(input_path, output_dir, max_duration=60):
     
     return parts, duration
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 أهلاً! أرسل فيديو أو رابط يوتيوب وسأقسمه إلى أجزاء 60 ثانية.")
+async def cleanup_files(file_paths):
+    """حذف الملفات بشكل آمن"""
+    for path in file_paths:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                logger.info(f"🗑️ Deleted: {path}")
+        except Exception as e:
+            logger.error(f"Failed to delete {path}: {e}")
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
@@ -61,29 +71,85 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not video:
         return
     
-    status_msg = await message.reply_text('⏳ جاري المعالجة...')
+    file_size = video.file_size or 0
+    
+    if file_size > MAX_VIDEO_SIZE:
+        await message.reply_text(f"❌ الفيديو كبير جداً!\nالحد الأقصى: {MAX_VIDEO_SIZE // (1024*1024)} ميجابايت")
+        return
+    
+    status_msg = await message.reply_text('⏳ جاري التحميل...')
+    temp_dir = None
     
     try:
+        # ✅ إنشاء مجلد مؤقت (يُحذف تلقائياً)
+        temp_dir = tempfile.mkdtemp()
+        logger.info(f"📁 Created temp directory: {temp_dir}")
+        
+        input_path = os.path.join(temp_dir, 'input.mp4')
+        
+        await status_msg.edit_text('⏳ جاري التحميل...')
         file = await video.get_file()
-        with tempfile.TemporaryDirectory() as temp_dir:
-            input_path = os.path.join(temp_dir, 'input.mp4')
-            await file.download_to_drive(input_path)
+        await file.download_to_drive(input_path)
+        
+        if not os.path.exists(input_path) or os.path.getsize(input_path) < 1000:
+            await status_msg.edit_text('❌ فشل التحميل')
+            return
+        
+        logger.info(f"📥 Downloaded: {input_path} ({os.path.getsize(input_path)} bytes)")
+        
+        await status_msg.edit_text('✂️ جاري التقسيم...')
+        parts, total_duration = split_video(input_path, temp_dir, MAX_DURATION)
+        
+        if not parts:
+            await status_msg.edit_text('❌ فشل التقسيم')
+            return
+        
+        total_parts = len(parts)
+        logger.info(f"✂️ Split into {total_parts} parts")
+        await status_msg.edit_text(f'📤 جاري إرسال {total_parts} جزء...')
+        
+        # إرسال الأجزاء
+        for i, part_path in enumerate(parts, 1):
+            if not os.path.exists(part_path):
+                continue
             
-            await status_msg.edit_text('✂️ جاري التقسيم...')
-            parts, duration = split_video(input_path, temp_dir, MAX_DURATION)
+            file_size = os.path.getsize(part_path)
             
-            if parts:
-                await status_msg.edit_text(f'📤 جاري إرسال {len(parts)} جزء...')
-                for i, part in enumerate(parts, 1):
-                    with open(part, 'rb') as f:
-                        await message.reply_video(video=f, caption=f'الجزء {i}/{len(parts)}', supports_streaming=True)
-                    await asyncio.sleep(0.5)
-                await status_msg.edit_text('✅ تم!')
-            else:
-                await status_msg.edit_text('❌ فشل التقسيم')
+            try:
+                if file_size > 20 * 1024 * 1024:
+                    with open(part_path, 'rb') as f:
+                        await message.reply_document(
+                            document=f,
+                            caption=f'📹 الجزء {i}/{total_parts}',
+                            filename=f'part_{i}.mp4'
+                        )
+                else:
+                    with open(part_path, 'rb') as f:
+                        await message.reply_video(
+                            video=f,
+                            caption=f'🎬 الجزء {i}/{total_parts}',
+                            supports_streaming=True
+                        )
+                logger.info(f"📤 Sent part {i}/{total_parts}")
+            except Exception as e:
+                logger.error(f"Failed to send part {i}: {e}")
+            
+            await asyncio.sleep(0.5)
+        
+        await status_msg.edit_text(f'✅ تم!\n📊 الأجزاء: {total_parts}\n⏱️ المدة: {int(total_duration)} ثانية\n🗑️ تم حذف الفيديو الأصلي')
+        
     except Exception as e:
-        logger.error(f"Error: {e}")
+        logger.error(f"Error: {e}", exc_info=True)
         await status_msg.edit_text(f'❌ خطأ: {str(e)}')
+    
+    finally:
+        # ✅ الحذف المؤكد للمجلد المؤقت وكل محتوياته
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                logger.info(f"🗑️ Cleaned up temp directory: {temp_dir}")
+            except Exception as e:
+                logger.error(f"Failed to cleanup {temp_dir}: {e}")
 
 async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text
@@ -91,28 +157,77 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     status_msg = await update.message.reply_text('🎥 جاري التحميل من يوتيوب...')
+    temp_dir = None
     
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            video_path = os.path.join(temp_dir, 'yt.mp4')
-            subprocess.run(['yt-dlp', '-f', 'best[ext=mp4]/best', '-o', video_path, '--no-playlist', url], capture_output=True, timeout=300)
+        temp_dir = tempfile.mkdtemp()
+        logger.info(f"📁 Created temp directory: {temp_dir}")
+        
+        video_path = os.path.join(temp_dir, 'yt.mp4')
+        
+        await status_msg.edit_text('🎥 جاري التحميل من يوتيوب...')
+        subprocess.run(['yt-dlp', '-f', 'best[ext=mp4]/best', '-o', video_path, '--no-playlist', url], capture_output=True, timeout=300)
+        
+        if not os.path.exists(video_path):
+            await status_msg.edit_text('❌ فشل التحميل')
+            return
+        
+        duration = get_video_duration(video_path)
+        if duration and duration > MAX_YOUTUBE_DURATION:
+            await status_msg.edit_text(f'❌ الفيديو طويل جداً: {int(duration//60)} دقيقة (الحد: 10 دقائق)')
+            return
+        
+        await status_msg.edit_text('✂️ جاري التقسيم...')
+        parts, total_duration = split_video(video_path, temp_dir, MAX_DURATION)
+        
+        if not parts:
+            await status_msg.edit_text('❌ فشل التقسيم')
+            return
+        
+        total_parts = len(parts)
+        await status_msg.edit_text(f'📤 جاري إرسال {total_parts} جزء...')
+        
+        for i, part_path in enumerate(parts, 1):
+            if not os.path.exists(part_path):
+                continue
             
-            if os.path.exists(video_path):
-                await status_msg.edit_text('✂️ جاري التقسيم...')
-                parts, duration = split_video(video_path, temp_dir, MAX_DURATION)
-                
-                if parts:
-                    await status_msg.edit_text(f'📤 جاري إرسال {len(parts)} جزء...')
-                    for i, part in enumerate(parts, 1):
-                        with open(part, 'rb') as f:
-                            await update.message.reply_video(video=f, caption=f'الجزء {i}/{len(parts)}', supports_streaming=True)
-                        await asyncio.sleep(0.5)
-                    await status_msg.edit_text('✅ تم!')
-            else:
-                await status_msg.edit_text('❌ فشل التحميل')
+            file_size = os.path.getsize(part_path)
+            
+            try:
+                if file_size > 20 * 1024 * 1024:
+                    with open(part_path, 'rb') as f:
+                        await update.message.reply_document(
+                            document=f,
+                            caption=f'📹 الجزء {i}/{total_parts}',
+                            filename=f'youtube_part_{i}.mp4'
+                        )
+                else:
+                    with open(part_path, 'rb') as f:
+                        await update.message.reply_video(
+                            video=f,
+                            caption=f'🎬 الجزء {i}/{total_parts}',
+                            supports_streaming=True
+                        )
+                logger.info(f"📤 Sent YouTube part {i}/{total_parts}")
+            except Exception as e:
+                logger.error(f"Failed to send part {i}: {e}")
+            
+            await asyncio.sleep(0.5)
+        
+        await status_msg.edit_text(f'✅ تم!\n📊 الأجزاء: {total_parts}\n⏱️ المدة: {int(total_duration)} ثانية\n🗑️ تم حذف الفيديو')
+    
     except Exception as e:
         logger.error(f"YouTube error: {e}")
         await status_msg.edit_text(f'❌ خطأ: {str(e)}')
+    
+    finally:
+        # ✅ الحذف المؤكد
+        if temp_dir and os.path.exists(temp_dir):
+            try:
+                shutil.rmtree(temp_dir)
+                logger.info(f"🗑️ Cleaned up temp directory: {temp_dir}")
+            except Exception as e:
+                logger.error(f"Failed to cleanup {temp_dir}: {e}")
 
 def main():
     if not BOT_TOKEN:
@@ -120,7 +235,7 @@ def main():
         return
     
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text("👋 أرسل فيديو أو رابط يوتيوب")))
     app.add_handler(MessageHandler(filters.VIDEO | filters.Document.MimeType('video/*'), handle_video))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube))
     app.run_polling()
