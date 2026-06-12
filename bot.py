@@ -69,7 +69,10 @@ async def safe_edit_message(message, new_text):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 أهلاً! أرسل فيديو أو رابط يوتيوب وسأقسمه لأجزاء 60 ثانية"
+        "👋 أهلاً! أنا بوت تقسيم الفيديوهات.\n\n"
+        "📹 أرسل فيديو (حتى 200MB) أو رابط يوتيوب\n"
+        "️ سأقسمه إلى أجزاء 60 ثانية\n"
+        "🎥 أدعم فيديوهات حتى 3 ساعات!"
     )
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -81,7 +84,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     file_size = video.file_size or 0
     if file_size > MAX_VIDEO_SIZE:
-        await message.reply_text(f"❌ الفيديو كبير جداً! الحد: {MAX_VIDEO_SIZE // (1024*1024)}MB")
+        await message.reply_text(f" الفيديو كبير جداً! الحد: {MAX_VIDEO_SIZE // (1024*1024)}MB")
         return
     
     status_msg = await message.reply_text('⏳ جاري التحميل...')
@@ -98,7 +101,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await safe_edit_message(status_msg, '❌ فشل التحميل')
             return
         
-        await safe_edit_message(status_msg, '✂️ جاري التقسيم...')
+        duration = get_video_duration(input_path)
+        if duration:
+            await safe_edit_message(status_msg, f'✂️ جاري التقسيم...\n⏱️ المدة: {int(duration//60)} دقيقة')
+        
         parts, total_duration = split_video(input_path, temp_dir, MAX_DURATION)
         
         if not parts:
@@ -138,13 +144,11 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         temp_dir = tempfile.mkdtemp()
         
-        # ✅ تحديث yt-dlp
         subprocess.run(['yt-dlp', '-U', '--quiet'], capture_output=True, timeout=30)
         
-        # ✅ خيارات تحميل محسّنة
         cmd = [
             'yt-dlp',
-            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            '-f', 'bestvideo+bestaudio/best',
             '--merge-output-format', 'mp4',
             '-o', os.path.join(temp_dir, 'video.%(ext)s'),
             '--no-playlist',
@@ -161,16 +165,24 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if result.returncode != 0:
             logger.error(f"yt-dlp error: {result.stderr}")
-            await safe_edit_message(status_msg, f'❌ فشل التحميل\nالخطأ: {result.stderr[:100]}')
+            if 'Requested format is not available' in result.stderr:
+                await safe_edit_message(status_msg, '❌ الصيغة غير متاحة\nجرب فيديو آخر')
+            else:
+                await safe_edit_message(status_msg, f'❌ فشل التحميل\n{result.stderr[:100]}')
             return
         
-        # البحث عن الملف
         video_file = None
-        for file in os.listdir(temp_dir):
-            if file.endswith('.mp4'):
-                video_file = os.path.join(temp_dir, file)
-                logger.info(f"✅ Found: {file}")
+        for ext in ['mp4', 'mkv', 'webm']:
+            file_path = os.path.join(temp_dir, f'video.{ext}')
+            if os.path.exists(file_path):
+                video_file = file_path
                 break
+        
+        if not video_file:
+            for file in os.listdir(temp_dir):
+                if file.endswith(('.mp4', '.mkv', '.webm')):
+                    video_file = os.path.join(temp_dir, file)
+                    break
         
         if not video_file:
             await safe_edit_message(status_msg, '❌ لم أجد الفيديو')
@@ -204,7 +216,6 @@ async def handle_youtube(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_message(status_msg, f'✅ تم! {len(parts)} جزء')
     
     except subprocess.TimeoutExpired:
-        logger.error("Timeout")
         await safe_edit_message(status_msg, '⏱️ انتهى الوقت')
     except Exception as e:
         logger.error(f"YouTube error: {e}", exc_info=True)
